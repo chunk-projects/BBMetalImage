@@ -62,6 +62,8 @@ public struct BBMetalDefaultTexture: BBMetalTexture {
     public var isCameraPhoto: Bool
     public let cvMetalTexture: CVMetalTexture? // Hold CVMetalTexture to prevent stuttering. https://stackoverflow.com/questions/43550769/holding-onto-a-mtltexture-from-a-cvimagebuffer-causes-stuttering
     
+    public var sampleBuffer: CMSampleBuffer?
+    
     public init(
         metalTexture: MTLTexture,
         sampleTime: CMTime? = nil,

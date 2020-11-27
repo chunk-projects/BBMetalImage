@@ -681,11 +681,14 @@ extension BBMetalCamera: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         }
         
         willTransmit?(texture.metalTexture, sampleTime)
-        let output = BBMetalDefaultTexture(metalTexture: texture.metalTexture,
+        var output = BBMetalDefaultTexture(metalTexture: texture.metalTexture,
                                            sampleTime: sampleTime,
                                            cameraPosition: cameraPosition,
                                            isCameraPhoto: isCameraPhoto,
                                            cvMetalTexture: texture.cvMetalTexture)
+        
+        output.sampleBuffer = sampleBuffer
+        
         for consumer in consumers { consumer.newTextureAvailable(output, from: self) }
         
         // Benchmark
