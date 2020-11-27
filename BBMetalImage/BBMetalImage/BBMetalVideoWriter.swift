@@ -17,8 +17,25 @@ public enum BBMetalVideoWriterProgressType {
     case audio(CMTime, Bool)
 }
 
+public enum BBMetalPauseState {
+    case playing
+    case pauseRequested
+    case paused
+}
+
 /// Video writer writing video file
 public class BBMetalVideoWriter {
+        
+    /// Pause/resume functionality
+    private var pauseState: BBMetalPauseState = .playing
+    private var awaitingTimeOffset = false
+    private var timeOffset = CMTime.zero
+    private var lastVideoTime = CMTime.zero
+    private var lastAudioTime = CMTime.zero
+    
+    public var isPaused: Bool { return pauseState == .paused }
+    public var isPlaying: Bool { return pauseState == .playing }
+    
     /// URL of video file
     public let url: URL
     /// Video frame size
@@ -126,6 +143,8 @@ public class BBMetalVideoWriter {
         
         self.startHandler = startHandler
         self.progress = progress
+        pauseState = .playing
+        timeOffset = CMTime.zero
         
         if writer == nil {
             if !prepareAssetWriter() {
@@ -256,6 +275,9 @@ extension BBMetalVideoWriter: BBMetalImageConsumer {
     public func remove(source: BBMetalImageSource) {}
     
     public func newTextureAvailable(_ texture: BBMetalTexture, from source: BBMetalImageSource) {
+        if pauseState == .paused {
+            return
+        }
         lock.wait()
         
         let startHandler = self.startHandler
@@ -278,15 +300,29 @@ extension BBMetalVideoWriter: BBMetalImageConsumer {
         }
         
         // Check nil
-        guard let sampleTime = texture.sampleTime,
-            let writer = self.writer,
-            let videoInput = self.videoInput,
-            let videoPixelBufferInput = self.videoPixelBufferInput else { return }
-        
+        guard let videoInput = self.videoInput else {
+            return
+        }
+        guard let videoPixelBufferInput = self.videoPixelBufferInput else {
+            return
+        }
+        guard let writer = self.writer else {
+            return
+        }
+        guard let defaultTexture = texture as? BBMetalDefaultTexture else {
+            print("No defaultTexture")
+            return
+        }
+        guard let originalSampleBuffer = defaultTexture.sampleBuffer else {
+            print("No originalSampleBuffer")
+            return
+        }
+        let finalSampleBuffer = updateSampleBufferAndStoreTime(originalSampleBuffer, video: true)
+        let finalSampleTime = CMSampleBufferGetPresentationTimeStamp(finalSampleBuffer)
         if videoPixelBuffer == nil {
             // First frame
             self.startHandler = nil // Set start handler to nil to ensure it is called only once
-            writer.startSession(atSourceTime: sampleTime)
+            writer.startSession(atSourceTime: finalSampleTime)
             guard let pool = videoPixelBufferInput.pixelBufferPool,
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &videoPixelBuffer) == kCVReturnSuccess else {
                     print("Can not create pixel buffer")
@@ -334,7 +370,7 @@ extension BBMetalVideoWriter: BBMetalImageConsumer {
         let region = MTLRegionMake2D(0, 0, outputTexture.width, outputTexture.height)
         outputTexture.getBytes(baseAddress, bytesPerRow: bytesPerRow, from: region, mipmapLevel: 0)
         
-        result = videoPixelBufferInput.append(videoPixelBuffer, withPresentationTime: sampleTime)
+        result = videoPixelBufferInput.append(videoPixelBuffer, withPresentationTime: finalSampleTime)
         
         CVPixelBufferUnlockBaseAddress(videoPixelBuffer, [])
     }
@@ -342,6 +378,9 @@ extension BBMetalVideoWriter: BBMetalImageConsumer {
 
 extension BBMetalVideoWriter: BBMetalAudioConsumer {
     public func newAudioSampleBufferAvailable(_ sampleBuffer: CMSampleBuffer) {
+        if pauseState == .paused {
+            return
+        }
         lock.wait()
         
         let progress = self.progress
@@ -370,6 +409,105 @@ extension BBMetalVideoWriter: BBMetalAudioConsumer {
                 return
         }
         
-        result = audioInput.append(sampleBuffer)
+        if pauseState == .pauseRequested {
+            pauseState = .paused
+            awaitingTimeOffset = true
+        }
+        if pauseState == .playing && awaitingTimeOffset {
+            handleTimeOffset(sampleBuffer)
+        }
+        let finalSampleBuffer = updateSampleBufferAndStoreTime(sampleBuffer, video: false)
+        result = audioInput.append(finalSampleBuffer)
     }
+}
+
+extension BBMetalVideoWriter {
+    
+    func getTimeAdjustedAudioBuffer(_ originalBuffer: CMSampleBuffer, offset: CMTime) -> CMSampleBuffer {
+        var timeAdjustedBuffer: CMSampleBuffer?
+        var originalTiming: CMSampleTimingInfo = CMSampleTimingInfo()
+        CMSampleBufferGetSampleTimingInfo(originalBuffer, at: 0, timingInfoOut: &originalTiming)
+        var timingInfo = CMSampleTimingInfo()
+        timingInfo.presentationTimeStamp = CMTimeAdd(timingInfo.presentationTimeStamp, offset)
+        timingInfo.decodeTimeStamp = CMTime.invalid
+        CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: originalBuffer, sampleTimingEntryCount: 1, sampleTimingArray: &timingInfo, sampleBufferOut: &timeAdjustedBuffer)
+        return timeAdjustedBuffer!
+    }
+    
+    func getTimeAdjustedVideoBuffer(_ originalBuffer: CMSampleBuffer, offset: CMTime) -> CMSampleBuffer {
+        var count: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(originalBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count);
+        var info = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(duration: CMTimeMake(value: 0, timescale: 0), presentationTimeStamp: CMTimeMake(value: 0, timescale: 0), decodeTimeStamp: CMTimeMake(value: 0, timescale: 0)), count: count)
+        CMSampleBufferGetSampleTimingInfoArray(originalBuffer, entryCount: count, arrayToFill: &info, entriesNeededOut: &count);
+        for i in 0..<count {
+            info[i].decodeTimeStamp = CMTimeSubtract(info[i].decodeTimeStamp, offset)
+            info[i].presentationTimeStamp = CMTimeSubtract(info[i].presentationTimeStamp, offset)
+        }
+        var timeAdjustedBuffer: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: originalBuffer, sampleTimingEntryCount: count, sampleTimingArray: &info, sampleBufferOut: &timeAdjustedBuffer);
+        return timeAdjustedBuffer!
+    }
+    
+    func updateSampleBufferAndStoreTime(_ inputSampleBuffer: CMSampleBuffer, video: Bool) -> CMSampleBuffer {
+        var sampleBuffer = inputSampleBuffer
+        if timeOffset.value > 0 {
+            if video {
+                sampleBuffer = getTimeAdjustedVideoBuffer(inputSampleBuffer, offset: timeOffset)
+            } else {
+                sampleBuffer = getTimeAdjustedAudioBuffer(inputSampleBuffer, offset: timeOffset)
+            }
+        }
+        // record most recent time so we know the length of the pause
+        var presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        if duration.value > 0 {
+            presentationTime = CMTimeAdd(presentationTime, duration)
+        }
+        if video {
+            lastVideoTime = presentationTime
+        } else {
+            lastAudioTime = presentationTime
+        }
+        return sampleBuffer
+    }
+    
+    func cmTimeIsValid(_ cmTime: CMTime) -> Bool {
+        return cmTime.flags.contains(.valid)
+    }
+    
+    func handleTimeOffset(_ sampleBuffer: CMSampleBuffer) {
+        awaitingTimeOffset = false
+        var pts: CMTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let last: CMTime = lastAudioTime
+        if cmTimeIsValid(last) {
+            if cmTimeIsValid(timeOffset) {
+                pts = CMTimeSubtract(pts, timeOffset)
+            }
+            let offset: CMTime = CMTimeSubtract(pts, last)
+            print("Adding offset \(CMTimeGetSeconds(offset))")
+            // this stops us having to set a scale for timeOffset before we see the first video time
+            if timeOffset.value == 0 {
+                timeOffset = offset
+                print("Setting time offset (first time): \(CMTimeGetSeconds(timeOffset))")
+            } else {
+                timeOffset = CMTimeAdd(timeOffset, offset);
+                print("Setting time offset: \(CMTimeGetSeconds(timeOffset))")
+            }
+        }
+        lastVideoTime.flags = CMTimeFlags()
+        lastAudioTime.flags = CMTimeFlags()
+    }
+    
+    public func pause() {
+        if pauseState == .playing {
+            pauseState = .pauseRequested
+        }
+    }
+    
+    public func resume() {
+        if pauseState == .paused {
+            pauseState = .playing
+        }
+    }
+    
 }
